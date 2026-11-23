@@ -1,0 +1,67 @@
+
+name: ClipForge APK Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract project
+        run: unzip -q ClipForgeAndroid-alpha.zip -d extracted
+
+      - name: Locate Android project
+        run: test -f extracted/ClipForgeAndroid/app/build.gradle.kts
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install test dependencies
+        run: pip install pytest
+
+      - name: Run backend tests
+        working-directory: extracted/ClipForgeAndroid/backend
+        run: PYTHONPATH=. pytest -q
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Accept SDK licenses
+        run: yes | sdkmanager --licenses
+
+      - name: Install SDK components
+        run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Build APK
+        working-directory: extracted/ClipForgeAndroid
+        run: gradle --no-daemon :app:assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ClipForge-debug-apk
+          path: extracted/ClipForgeAndroid/app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 14
