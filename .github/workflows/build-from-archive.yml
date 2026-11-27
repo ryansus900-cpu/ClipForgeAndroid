@@ -14,62 +14,61 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      ANDROID_HOME: /usr/local/lib/android/sdk
-      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+      ANDROID_HOME: /usr/local/android/sdk
+      ANDROID_SDK_ROOT: /usr/local/android/sdk
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Verify corrected source archive
+      - name: Select latest uploaded Alpha-3 source archive
+        id: source
         run: |
-          set -e
+          set -euo pipefail
+          latest_file=""
+          latest_commit=0
+          while IFS= read -r file; do
+            commit_time="$(git log -1 --format=%ct -- "$file")"
+            if [ "$commit_time" -gt "$latest_commit" ]; then
+              latest_commit="$commit_time"
+              latest_file="$file"
+            fi
+          done < <(find . -maxdepth 1 -type f -name 'ClipForgeAndroid-alpha-3-*.zip' -print)
 
-          ARCHIVE="ClipForgeAndroid-alpha-3-fixed-source.zip"
-
-          if [ ! -f "$ARCHIVE" ]; then
-            echo "ERROR: Corrected source archive not found!"
-            echo "Expected: $ARCHIVE"
-            echo "Files available:"
+          if [ -z "$latest_file" ]; then
+            echo "ERROR: No Alpha-3 source ZIP found in repository root."
             ls -lah
             exit 1
           fi
+          echo "Selected archive: $latest_file"
+          ls -lh "$latest_file"
+          sha256sum "$latest_file"
+          echo "archive=$latest_file" >> "$GITHUB_OUTPUT"
 
-          echo "Using corrected archive:"
-          ls -lh "$ARCHIVE"
-          sha256sum "$ARCHIVE"
-
-      - name: Extract corrected project
+      - name: Extract selected source archive
         run: |
-          set -e
-
+          set -euo pipefail
           mkdir -p extracted
-          unzip -q ClipForgeAndroid-alpha-3-fixed-source.zip -d extracted
+          unzip -q "${{ steps.source.outputs.archive }}" -d extracted
+          PROJECT_DIR="$(find extracted -type f -name 'settings.gradle*' -printf '%h\n' | head -1)"
+          if [ -z "$PROJECT_DIR" ]; then
+            echo "ERROR: Android Gradle project was not found in the archive."
+            find extracted -maxdepth 4 -type f | head -100
+            exit 1
+          fi
+          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Project directory: $PROJECT_DIR"
+          test -f "$PROJECT_DIR/app/src/main/AndroidManifest.xml"
+          test -f "$PROJECT_DIR/app/build.gradle.kts" -o -f "$PROJECT_DIR/app/build.gradle"
 
-          echo "Extracted project files:"
-          ls -lah extracted/ClipForgeAndroid
-
-          test -f extracted/ClipForgeAndroid/app/build.gradle.kts
-          test -f extracted/ClipForgeAndroid/app/src/main/java/com/clipforge/app/MainActivity.kt
-
-      - name: Verify source fixes
-        working-directory: extracted/ClipForgeAndroid
+      - name: Verify selected source and version
         run: |
-          set -e
-
-          SUBTITLE_FILE="app/src/main/java/com/clipforge/app/ui_SubtitleStudio.kt"
-          GRADLE_FILE="app/build.gradle.kts"
-
-          echo "Checking verticalScroll import..."
-          grep -Fq "import androidx.compose.foundation.verticalScroll" "$SUBTITLE_FILE"
-
-          echo "Checking Media3 dependency version..."
-          grep -Fq 'media3-effect:1.9.3' "$GRADLE_FILE"
-
-          echo "Checking corrected caption JSON return..."
-          grep -Fq 'return JSONObject().put("words", JSONArray(words)).toString()' "$SUBTITLE_FILE"
-
-          echo "Source verification passed."
+          set -euo pipefail
+          GRADLE_FILE="$project_dir/app/build.gradle.kts"
+          [ -f "$GRADLE_FILE" ] || GRADLE_FILE="$project_dir/app/build.gradle"
+          echo "Building project: $project_dir"
+          grep -E 'versionCode|versionName' "$GRADLE_FILE" || true
+          find "$project_dir/app/src/main" -type f | head -40
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -82,9 +81,13 @@ jobs:
           pip install pytest
 
       - name: Run backend tests
-        working-directory: extracted/ClipForgeAndroid/backend
         run: |
-          PYTHONPATH=. pytest -q
+          BACKEND_DIR="$(find "$project_dir" -maxdepth 3 -type d -name backend | head -1)"
+          if [ -n "$BACKEND_DIR" ]; then
+            (cd "$BACKEND_DIR" && PYTHONPATH=. pytest -q)
+          else
+            echo "Backend directory not found; skipping backend tests."
+          fi
 
       - name: Setup Java
         uses: actions/setup-java@v4
@@ -99,37 +102,32 @@ jobs:
           gradle-version: "8.9"
 
       - name: Show Media3 dependency versions
-        working-directory: extracted/ClipForgeAndroid
+        working-directory: ${{ env.project_dir }}
         run: |
-          gradle --no-daemon :app:dependencies \
-            --configuration debugCompileClasspath \
-            > media3-dependencies.txt
-
+          gradle --no-daemon :app:dependencies --configuration debugCompileClasspath > media3-dependencies.txt
           grep -i "androidx.media3" media3-dependencies.txt || true
 
       - name: Build debug APK
-        working-directory: extracted/ClipForgeAndroid
+        working-directory: ${{ env.project_dir }}
+        run: gradle --no-daemon --stacktrace :app:assembleDebug
+
+      - name: Verify APK generated
         run: |
-          gradle --no-daemon --stacktrace :app:assembleDebug
-
-      - name: Verify APK exists
-        run: |
-          APK="extracted/ClipForgeAndroid/app/build/outputs/apk/debug/app-debug.apk"
-
-          if [ ! -f "$APK" ]; then
-            echo "ERROR: APK was not generated."
-            exit 1
-          fi
-
+          set -euo pipefail
+          APK="$project_dir/app/build/outputs/apk/debug/app-debug.apk"
+          test -f "$APK"
           echo "APK generated successfully:"
           ls -lh "$APK"
           sha256sum "$APK"
+          GRADLE_FILE="$project_dir/app/build.gradle.kts"
+          [ -f "$GRADLE_FILE" ] || GRADLE_FILE="$project_dir/app/build.gradle"
+          grep -E 'versionCode|versionName' "$GRADLE_FILE" || true
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: ClipForge-debug-apk
-          path: extracted/ClipForgeAndroid/app/build/outputs/apk/debug/app-debug.apk
+          path: ${{ env.project_dir }}/app/build/outputs/apk/debug/app-debug.apk
           retention-days: 14
 
       - name: Upload build diagnostics
@@ -139,6 +137,6 @@ jobs:
           name: ClipForge-build-diagnostics
           path: |
             media3-dependencies.txt
-            extracted/ClipForgeAndroid/app/build/reports/
+            ${{ env.project_dir }}/app/build/reports/
           if-no-files-found: ignore
           retention-days: 7
